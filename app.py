@@ -5,12 +5,14 @@ import socket
 from datetime import date
 
 from flask import Flask, Response, flash, jsonify, redirect, render_template, request, url_for
-from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import contains_eager, selectinload
 
+from constants import ESTRATOS, ESTADOS, ESTADO_TEXTO, SEXOS, ZONAS
 from config import Config
+from dao import (catalogos_dao, causas_dao, estudiantes_dao, grupos_dao, instituciones_dao, programas_dao,
+                 session_dao)
 from models import CausaRetiro, Estudiante, Grupo, Institucion, Matricula, ProgramaApoyo, db
+from services import escolar_service
 
 # ---------- CONEXIÓN ----------
 app = Flask(__name__)
@@ -21,14 +23,6 @@ if os.environ.get("DATABASE_URL"):
 app.json.ensure_ascii = False
 app.json.sort_keys = False
 db.init_app(app)
-
-# ---------- CATÁLOGOS ----------
-SEXOS = ("Femenino", "Masculino")
-ZONAS = ("Urbana", "Rural")
-ESTRATOS = tuple(range(0, 7))
-ESTADOS = ("ACTIVA", "RETIRADO", "GRADUADO")
-ESTADO_TEXTO = {"ACTIVA": "Activa", "RETIRADO": "Retirado", "GRADUADO": "Graduado", None: "Sin matrícula"}
-
 
 def estatico(archivo):
     # La fecha del archivo en la URL obliga al navegador a bajar la versión nueva
@@ -55,173 +49,42 @@ def leer_filtros():
 
 
 def institucion_o_none(id_institucion):
-    return db.session.get(Institucion, id_institucion) if id_institucion else None
+    return instituciones_dao.get_optional(id_institucion)
 
 
 # ---------- CONSULTAS: ESTUDIANTES (CASO DE USO 1) ----------
 def matricula_actual(e):
-    return max(e.matriculas, key=lambda m: (m.fecha, m.id_matricula), default=None)
+    return escolar_service.matricula_actual(e)
 
 
 def fila_estudiante(e):
-    m = matricula_actual(e)
-    g = m.grupo if m else None
-    return {
-        "id": e.id_estudiante,
-        "nombre": f"{e.nombres} {e.apellidos}",
-        "sexo": e.sexo,
-        "zona": e.zona,
-        "estrato": e.estrato,
-        "discapacidad": bool(e.discapacidad),
-        "id_institucion": g.id_institucion if g else None,
-        "institucion": g.institucion.nombre if g else None,
-        "grado": g.grado if g else None,
-        "jornada": g.jornada if g else None,
-        "estado": m.estado if m else None,
-        "causa": m.causa.descripcion if m and m.causa else None,
-        "programa": m.programa.nombre if m and m.programa else None,
-    }
+    return escolar_service.fila_estudiante(e)
 
 
 def estudiantes(zona=None, id_institucion=None):
-    q = (Estudiante.query
-         .options(selectinload(Estudiante.matriculas).options(
-             selectinload(Matricula.grupo).selectinload(Grupo.institucion),
-             selectinload(Matricula.causa),
-             selectinload(Matricula.programa)))
-         .order_by(Estudiante.apellidos, Estudiante.nombres))
-    if zona:
-        q = q.filter(Estudiante.zona == zona)
-    filas = [fila_estudiante(e) for e in q]
-    if id_institucion:
-        filas = [f for f in filas if f["id_institucion"] == id_institucion]
-    return filas
+    return escolar_service.estudiantes(zona, id_institucion)
 
 
 def estados_por_zona(filas):
-    resumen = []
-    for zona in ZONAS:
-        de_zona = [f for f in filas if f["zona"] == zona]
-        conteo = {estado: sum(f["estado"] == estado for f in de_zona) for estado in (*ESTADOS, None)}
-        total = len(de_zona) or 1
-        resumen.append({
-            "zona": zona,
-            "total": len(de_zona),
-            "segmentos": [{"estado": estado, "n": n, "ancho": 100 * n / total}
-                          for estado, n in conteo.items() if n],
-        })
-    return resumen
+    return escolar_service.estados_por_zona(filas)
 
 
 # ---------- CONSULTAS: DESERCIÓN (CASO DE USO 2) ----------
-RETIRADOS = func.sum(case((Matricula.estado == "RETIRADO", 1), else_=0))
-
-
-def matriculas_base(*columnas, zona=None, id_institucion=None):
-    q = (db.session.query(*columnas).select_from(Matricula)
-         .join(Matricula.estudiante).join(Matricula.grupo).join(Grupo.institucion))
-    if zona:
-        q = q.filter(Estudiante.zona == zona)
-    if id_institucion:
-        q = q.filter(Grupo.id_institucion == id_institucion)
-    return q
-
-
-def tasa_por(columna, **filtros):
-    q = (matriculas_base(columna.label("nombre"), func.count(Matricula.id_matricula), RETIRADOS, **filtros)
-         .group_by(columna))
-    filas = []
-    for nombre, matriculados, retirados in q:
-        retirados = int(retirados or 0)
-        filas.append({"nombre": "Sin dato" if nombre is None else str(nombre),
-                      "matriculados": matriculados, "retirados": retirados,
-                      "tasa": 100 * retirados / matriculados})
-    return sorted(filas, key=lambda f: (-f["tasa"], f["nombre"]))
-
-
-def retiros_por(columna, relacion, vacio, **filtros):
-    q = (matriculas_base(columna, func.count(Matricula.id_matricula), **filtros)
-         .outerjoin(relacion).filter(Matricula.estado == "RETIRADO").group_by(columna))
-    filas = [{"nombre": nombre or vacio, "retirados": n} for nombre, n in q]
-    return sorted(filas, key=lambda f: (-f["retirados"], f["nombre"]))
-
-
-def lista_retirados(**filtros):
-    q = (matriculas_base(Matricula, **filtros)
-         .filter(Matricula.estado == "RETIRADO")
-         .options(contains_eager(Matricula.estudiante),
-                  contains_eager(Matricula.grupo).contains_eager(Grupo.institucion),
-                  selectinload(Matricula.causa), selectinload(Matricula.programa))
-         .order_by(Matricula.fecha.desc(), Estudiante.apellidos))
-    return [{
-        "id": m.id_estudiante,
-        "nombre": f"{m.estudiante.nombres} {m.estudiante.apellidos}",
-        "zona": m.estudiante.zona,
-        "estrato": m.estudiante.estrato,
-        "institucion": m.grupo.institucion.nombre,
-        "grado": m.grupo.grado,
-        "fecha": m.fecha.isoformat(),
-        "causa": m.causa.descripcion if m.causa else None,
-        "programa": m.programa.nombre if m.programa else None,
-    } for m in q]
-
-
 def desercion(zona=None, id_institucion=None):
-    filtros = {"zona": zona, "id_institucion": id_institucion}
-    total, retirados = matriculas_base(func.count(Matricula.id_matricula), RETIRADOS, **filtros).one()
-    retirados = int(retirados or 0)
-    activas = matriculas_base(func.count(Matricula.id_matricula), **filtros).filter(
-        Matricula.estado == "ACTIVA").scalar()
-    return {
-        "totales": {"matriculas": total, "retirados": retirados, "activas": activas,
-                    "tasa": 100 * retirados / total if total else 0},
-        "por_institucion": tasa_por(Institucion.nombre, **filtros),
-        "por_zona": tasa_por(Estudiante.zona, **filtros),
-        "por_estrato": sorted(({**f, "nombre": f"Estrato {f['nombre']}"}
-                               for f in tasa_por(Estudiante.estrato, **filtros)),
-                              key=lambda f: f["nombre"]),
-        "por_causa": retiros_por(CausaRetiro.descripcion, Matricula.causa, "Sin causa", **filtros),
-        "por_programa": retiros_por(ProgramaApoyo.nombre, Matricula.programa, "Sin programa", **filtros),
-        "retirados": lista_retirados(**filtros),
-    }
+    return escolar_service.desercion(zona, id_institucion)
 
 
 def hallazgos(d):
-    t = d["totales"]
-    if not t["retirados"]:
-        return ["No hay retiros registrados con estos filtros."]
-    texto = [f"{t['retirados']} de {t['matriculas']} matrículas terminaron en retiro ({pct(t['tasa'])})."]
-    if d["por_causa"]:
-        c = d["por_causa"][0]
-        texto.append(f"La causa más frecuente es «{c['nombre']}»: {c['retirados']} de {t['retirados']} retiros.")
-    if len(d["por_institucion"]) > 1:
-        i = d["por_institucion"][0]
-        texto.append(f"{i['nombre']} tiene la tasa más alta: {pct(i['tasa'])} "
-                     f"({i['retirados']} de {i['matriculados']}).")
-    zonas = {z["nombre"]: z for z in d["por_zona"]}
-    if "Rural" in zonas and "Urbana" in zonas:
-        texto.append(f"Zona rural: {pct(zonas['Rural']['tasa'])} frente a {pct(zonas['Urbana']['tasa'])} en la urbana.")
-    if d["por_estrato"]:
-        e = max(d["por_estrato"], key=lambda f: f["tasa"])
-        texto.append(f"{e['nombre']} concentra la tasa más alta: {pct(e['tasa'])}.")
-    sin_apoyo = next((p for p in d["por_programa"] if p["nombre"] == "Sin programa"), None)
-    if sin_apoyo:
-        n = sin_apoyo["retirados"]
-        texto.append(f"{n} {'retirado no recibía' if n == 1 else 'retirados no recibían'} ningún programa de apoyo.")
-    return texto
+    return escolar_service.hallazgos(d)
 
 
 # ---------- GRÁFICOS ----------
 def barras_tasa(filas):
-    tope = max((f["tasa"] for f in filas), default=0) or 1
-    return [{"nombre": f["nombre"], "ancho": 100 * f["tasa"] / tope, "valor": pct(f["tasa"]),
-             "detalle": f"{f['retirados']} de {f['matriculados']} matrículas"} for f in filas]
+    return escolar_service.barras_tasa(filas)
 
 
 def barras_conteo(filas):
-    tope = max((f["retirados"] for f in filas), default=0) or 1
-    return [{"nombre": f["nombre"], "ancho": 100 * f["retirados"] / tope, "valor": str(f["retirados"]),
-             "detalle": f"{f['retirados']} {'retiro' if f['retirados'] == 1 else 'retiros'}"} for f in filas]
+    return escolar_service.barras_conteo(filas)
 
 
 # ---------- FORMULARIO ----------
@@ -284,17 +147,17 @@ def leer_formulario(f):
     d["discapacidad"] = "discapacidad" in f
 
     d["id_grupo"] = entero(f.get("id_grupo"))
-    if f.get("id_grupo") and not (d["id_grupo"] and db.session.get(Grupo, d["id_grupo"])):
+    if f.get("id_grupo") and not grupos_dao.exists(d["id_grupo"]):
         err["id_grupo"] = "Grupo no válido"
     if d["id_grupo"]:
         d["estado"] = f.get("estado")
         if d["estado"] not in ESTADOS:
             err["estado"] = "Elija un estado"
         d["id_causa"] = entero(f.get("id_causa")) if d["estado"] == "RETIRADO" else None
-        if d["estado"] == "RETIRADO" and not (d["id_causa"] and db.session.get(CausaRetiro, d["id_causa"])):
+        if d["estado"] == "RETIRADO" and not causas_dao.exists(d["id_causa"]):
             err["id_causa"] = "Indique la causa del retiro"
         d["id_programa"] = entero(f.get("id_programa"))
-        if f.get("id_programa") and not (d["id_programa"] and db.session.get(ProgramaApoyo, d["id_programa"])):
+        if f.get("id_programa") and not programas_dao.exists(d["id_programa"]):
             err["id_programa"] = "Programa no válido"
     return d, err
 
@@ -312,14 +175,11 @@ def guardar_estudiante(e, d):
 
 
 def pintar_formulario(e, valores, errores=None, codigo=200):
-    grupos = (Grupo.query.join(Grupo.institucion)
-              .options(selectinload(Grupo.institucion))
-              .order_by(Institucion.nombre, Grupo.anio_lectivo.desc(), Grupo.grado).all())
     return render_template(
         "estudiante_modal.html" if request.headers.get("X-Modal") else "estudiante_form.html", e=e, v=valores, errores=errores or {},
-        grupos=grupos,
-        causas=CausaRetiro.query.order_by(CausaRetiro.descripcion).all(),
-        programas=ProgramaApoyo.query.order_by(ProgramaApoyo.nombre).all(),
+        grupos=grupos_dao.list_for_form(),
+        causas=causas_dao.list_ordered(),
+        programas=programas_dao.list_ordered(),
     ), codigo
 
 
@@ -332,11 +192,11 @@ def procesar_formulario(e, mensaje):
     e = e or Estudiante()
     guardar_estudiante(e, d)
     if nuevo:
-        db.session.add(e)
+        session_dao.add(e)
     try:
-        db.session.commit()
+        session_dao.commit()
     except IntegrityError:
-        db.session.rollback()
+        session_dao.rollback()
         return pintar_formulario(None if nuevo else e, valores, {"id_grupo": "Ya tiene una matrícula en ese grupo"}, 409)
     flash(f"{e.nombres} {e.apellidos}: {mensaje}", "ok")
     if request.headers.get("X-Modal"):
@@ -356,7 +216,7 @@ def listar():
     filas = estudiantes(zona, id_inst)
     return render_template(
         "estudiantes.html", filas=filas, zona=zona, inst=institucion_o_none(id_inst),
-        instituciones=Institucion.query.order_by(Institucion.nombre).all(),
+        instituciones=instituciones_dao.list_ordered(),
         resumen=estados_por_zona(filas if not zona else estudiantes(None, id_inst)),
     )
 
@@ -370,7 +230,7 @@ def crear():
 
 @app.route("/estudiantes/<int:id>/editar", methods=["GET", "POST"])
 def editar(id):
-    e = db.get_or_404(Estudiante, id)
+    e = estudiantes_dao.get_or_404(id)
     if request.method == "POST":
         return procesar_formulario(e, "cambios guardados")
     return pintar_formulario(e, valores_de(e))
@@ -378,14 +238,14 @@ def editar(id):
 
 @app.route("/estudiantes/<int:id>/eliminar", methods=["POST"])
 def eliminar(id):
-    e = db.get_or_404(Estudiante, id)
+    e = estudiantes_dao.get_or_404(id)
     nombre, n = f"{e.nombres} {e.apellidos}", len(e.matriculas)
     try:
-        db.session.delete(e)
-        db.session.commit()
+        session_dao.delete(e)
+        session_dao.commit()
         flash(f"{nombre}: eliminado", "ok")
     except IntegrityError:
-        db.session.rollback()
+        session_dao.rollback()
         flash(f"No se puede eliminar a {nombre}: tiene {n} {'matrícula' if n == 1 else 'matrículas'}. "
               "Si dejó de estudiar, márquelo como Retirado.", "error")
     return redirect(url_for("listar"))
@@ -397,7 +257,7 @@ def ver_desercion():
     d = desercion(zona, id_inst)
     return render_template(
         "desercion.html", d=d, zona=zona, inst=institucion_o_none(id_inst),
-        instituciones=Institucion.query.order_by(Institucion.nombre).all(),
+        instituciones=instituciones_dao.list_ordered(),
         hallazgos=hallazgos(d), hoy=date.today(),
         graficos=[
             ("Tasa de deserción por institución", barras_tasa(d["por_institucion"])),
@@ -523,7 +383,7 @@ def json_programa(p):
 
 @app.get("/api/instituciones")
 def api_instituciones():
-    return jsonify([json_institucion(i) for i in Institucion.query.order_by(Institucion.nombre)])
+    return jsonify([json_institucion(i) for i in instituciones_dao.list_ordered()])
 
 
 @app.get("/api/estudiantes")
@@ -534,7 +394,7 @@ def api_estudiantes():
 
 @app.get("/api/estudiantes/<int:id>")
 def api_estudiante(id):
-    return jsonify(fila_estudiante(db.get_or_404(Estudiante, id)))
+    return jsonify(fila_estudiante(estudiantes_dao.get_or_404(id)))
 
 
 @app.get("/api/zonas")
@@ -555,20 +415,17 @@ def api_desercion():
 @app.get("/api/grupos")
 def api_grupos():
     _, id_inst = leer_filtros()
-    q = Grupo.query.options(selectinload(Grupo.institucion)).order_by(Grupo.anio_lectivo.desc(), Grupo.grado)
-    if id_inst:
-        q = q.filter(Grupo.id_institucion == id_inst)
-    return jsonify([json_grupo(g) for g in q])
+    return jsonify([json_grupo(g) for g in grupos_dao.list_for_api(id_inst)])
 
 
 @app.get("/api/causas")
 def api_causas():
-    return jsonify([json_causa(c) for c in CausaRetiro.query.order_by(CausaRetiro.descripcion)])
+    return jsonify([json_causa(c) for c in causas_dao.list_ordered()])
 
 
 @app.get("/api/programas")
 def api_programas():
-    return jsonify([json_programa(p) for p in ProgramaApoyo.query.order_by(ProgramaApoyo.nombre)])
+    return jsonify([json_programa(p) for p in programas_dao.list_ordered()])
 
 
 # ---------- API: ESCRITURA ----------
@@ -587,11 +444,11 @@ def cuerpo_json():
 
 def confirmar(obj, nuevo, choque):
     if nuevo:
-        db.session.add(obj)
+        session_dao.add(obj)
     try:
-        db.session.commit()
+        session_dao.commit()
     except IntegrityError:
-        db.session.rollback()
+        session_dao.rollback()
         return False, error_json(choque, 409)
     return True, None
 
@@ -599,7 +456,7 @@ def confirmar(obj, nuevo, choque):
 def eliminar_api(obj, datos, n, uno, varios):
     if n:
         return error_json(f"No se puede eliminar: aparece en {n} {uno if n == 1 else varios}", 409)
-    db.session.delete(obj)
+    session_dao.delete(obj)
     ok, fallo = confirmar(obj, False, "No se puede eliminar: otros registros lo usan")
     return jsonify({"eliminado": datos}) if ok else fallo
 
@@ -654,12 +511,12 @@ def api_crear_estudiante():
 
 @app.put("/api/estudiantes/<int:id>")
 def api_editar_estudiante(id):
-    return escribir_estudiante(db.get_or_404(Estudiante, id))
+    return escribir_estudiante(estudiantes_dao.get_or_404(id))
 
 
 @app.delete("/api/estudiantes/<int:id>")
 def api_eliminar_estudiante(id):
-    e = db.get_or_404(Estudiante, id)
+    e = estudiantes_dao.get_or_404(id)
     return eliminar_api(e, fila_estudiante(e), len(e.matriculas), "matrícula", "matrículas")
 
 
@@ -712,7 +569,7 @@ def leer_catalogo(campos, cuerpo, nuevo):
             else:
                 err[k] = "Año entre 1990 y 2100"
         elif tipo == "institucion":
-            if n and db.session.get(Institucion, n):
+            if instituciones_dao.exists(n):
                 d[k] = n
             else:
                 err[k] = "No existe esa institución"
@@ -738,7 +595,7 @@ def escribir_catalogo(ruta, obj):
 @app.get(f"/api/<{CATALOGO}:ruta>/<int:id>")
 def api_catalogo_uno(ruta, id):
     c = CATALOGOS[ruta]
-    return jsonify(c["json"](db.get_or_404(c["modelo"], id)))
+    return jsonify(c["json"](catalogos_dao.get_or_404(c["modelo"], id)))
 
 
 @app.post(f"/api/<{CATALOGO}:ruta>")
@@ -748,13 +605,13 @@ def api_catalogo_crear(ruta):
 
 @app.put(f"/api/<{CATALOGO}:ruta>/<int:id>")
 def api_catalogo_editar(ruta, id):
-    return escribir_catalogo(ruta, db.get_or_404(CATALOGOS[ruta]["modelo"], id))
+    return escribir_catalogo(ruta, catalogos_dao.get_or_404(CATALOGOS[ruta]["modelo"], id))
 
 
 @app.delete(f"/api/<{CATALOGO}:ruta>/<int:id>")
 def api_catalogo_eliminar(ruta, id):
     c = CATALOGOS[ruta]
-    obj = db.get_or_404(c["modelo"], id)
+    obj = catalogos_dao.get_or_404(c["modelo"], id)
     relacion, uno, varios = c["uso"]
     return eliminar_api(obj, c["json"](obj), len(getattr(obj, relacion)), uno, varios)
 
@@ -883,16 +740,15 @@ API = [
 
 @app.get("/api")
 def api_docs():
-    grupos_bd = Grupo.query.join(Grupo.institucion).options(contains_eager(Grupo.institucion)) \
-        .order_by(Institucion.nombre, Grupo.anio_lectivo.desc(), Grupo.grado).all()
-    instituciones = Institucion.query.order_by(Institucion.nombre).all()
+    grupos_bd = grupos_dao.list_for_api_docs()
+    instituciones = instituciones_dao.list_ordered()
     opciones = {
         "estudiantes": [(e.id_estudiante, f"{e.nombres} {e.apellidos}")
-                        for e in Estudiante.query.order_by(Estudiante.apellidos, Estudiante.nombres)],
+                        for e in estudiantes_dao.list_ordered()],
         "instituciones": [(i.id_institucion, i.nombre) for i in instituciones],
         "grupos": [(g.id_grupo, f"{g.grado} · {g.institucion.nombre} · {g.anio_lectivo}") for g in grupos_bd],
-        "causas": [(c.id_causa, c.descripcion) for c in CausaRetiro.query.order_by(CausaRetiro.descripcion)],
-        "programas": [(p.id_programa, p.nombre) for p in ProgramaApoyo.query.order_by(ProgramaApoyo.nombre)],
+        "causas": [(c.id_causa, c.descripcion) for c in causas_dao.list_ordered()],
+        "programas": [(p.id_programa, p.nombre) for p in programas_dao.list_ordered()],
     }
     ids = {UN_GRUPO: grupos_bd[0].id_grupo if grupos_bd else None,
            UNA_INSTITUCION: instituciones[0].id_institucion if instituciones else None}
@@ -907,7 +763,7 @@ def api_docs():
 # ---------- ERRORES ----------
 @app.errorhandler(OperationalError)
 def sin_base(e):
-    db.session.rollback()
+    session_dao.rollback()
     if request.path.startswith("/api/"):
         return jsonify({"error": "Sin conexión con la base de datos"}), 503
     return render_template("sin_base.html", detalle=str(e.orig)), 503
