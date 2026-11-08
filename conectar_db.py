@@ -3,7 +3,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-import pymysql
+import psycopg2
 
 # Buscar el .env en la misma carpeta
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,25 +40,27 @@ def main():
         return
 
     try:
-        conexion = pymysql.connect(
+        conexion = psycopg2.connect(
             host=host,
             port=int(puerto),
             user=usuario,
             password=password,
-            database=base,
-            charset="utf8mb4"
+            dbname=base,
+            sslmode=config.get("DB_SSLMODE", "prefer")
         )
-        
+
         with conexion.cursor() as cur:
-            cur.execute("SELECT VERSION()")
+            cur.execute("SHOW server_version")
             version = cur.fetchone()[0]
-            cur.execute("SELECT DATABASE()")
+            cur.execute("SELECT current_database()")
             base_actual = cur.fetchone()[0]
-            cur.execute("SHOW TABLES")
-            tablas = len(cur.fetchall())
+            cur.execute("SELECT count(*) FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'")
+            tablas = cur.fetchone()[0]
+        conexion.close()
 
         print(f"  Host     : {host}:{puerto}")
-        print(f"  Motor    : MariaDB/MySQL {version}")
+        print(f"  Motor    : PostgreSQL {version}")
         print(f"  Base     : {base_actual} ({tablas} tablas)")
         print("  Resultado: Conexión establecida")
         
@@ -67,7 +69,6 @@ def main():
         print("  Resultado: CONEXIÓN FALLIDA")
         
     print("=" * 60)
-    conexion.close()
 
 if __name__ == "__main__":
     main()
