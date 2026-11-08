@@ -19,7 +19,8 @@ app = Flask(__name__)
 app.config.from_object(Config)
 if os.environ.get("DATABASE_URL"):
     app.config["SQLALCHEMY_DATABASE_URI"] = os.environ["DATABASE_URL"]
-    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {}
+    # Vercel congela la función entre visitas: la conexión guardada puede llegar cerrada
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 280}
 app.json.ensure_ascii = False
 app.json.sort_keys = False
 db.init_app(app)
